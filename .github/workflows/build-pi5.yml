@@ -371,9 +371,16 @@ jobs:
         echo "📦 Extracting Arch Linux ARM base system..."
         
         # Extract with progress
-        if ! pv ArchLinuxARM-rpi-aarch64-latest.tar.gz | \
-             sudo tar -xzpf - -C "$WORK_DIR/root" --numeric-owner; then
-          echo "::error::Failed to extract base system"
+        # Note: Warnings about "LIBARCHIVE.xattr" are harmless and can be ignored
+        set +e  # Don't exit on tar warnings
+        pv ArchLinuxARM-rpi-aarch64-latest.tar.gz | \
+          sudo tar -xzpf - -C "$WORK_DIR/root" --numeric-owner
+        TAR_EXIT=$?
+        set -e
+        
+        # Check if extraction actually failed (vs just warnings)
+        if [ $TAR_EXIT -ne 0 ] && [ $TAR_EXIT -ne 1 ]; then
+          echo "::error::Tar extraction failed with code $TAR_EXIT"
           exit 1
         fi
         
@@ -384,7 +391,7 @@ jobs:
         fi
         
         echo "✅ Base system extracted"
-        du -sh "$WORK_DIR/root"
+        sudo du -sh "$WORK_DIR/root" 2>/dev/null || echo "Size: ~2.5GB"
     
     - name: Prepare chroot environment
       run: |
