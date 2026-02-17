@@ -1,4 +1,24 @@
-name: Build NyarchLinux for Raspberry Pi 5
+            - name: Cache
+  uses: actions/cache@v5.0.3
+  with:
+    # A list of files, directories, and wildcard patterns to cache and restore
+    path: 
+    # An explicit key for restoring and saving the cache
+    key: 
+    # An ordered multiline string listing the prefix-matched keys, that are used for restoring stale cache if no cache hit occurred for key. Note `cache-hit` returns false in this case.
+    restore-keys: # optional
+    # The chunk size used to split up large files during upload, in bytes
+    upload-chunk-size: # optional
+    # An optional boolean when enabled, allows windows runners to save or restore caches that can be restored or saved respectively on other platforms
+    enableCrossOsArchive: # optional, default is false
+    # Fail the workflow if cache entry is not found
+    fail-on-cache-miss: # optional, default is false
+    # Check if a cache entry exists for the given input(s) (key, restore-keys) without downloading the cache
+    lookup-only: # optional, default is false
+    # Run the post step to save the cache even if another step before fails
+    save-always: # optional, default is false
+          
+          name: Build NyarchLinux for Raspberry Pi 5
 
 on:
   push:
@@ -55,8 +75,24 @@ jobs:
           parted \
           dosfstools \
           wget \
-          kpartx \
-          systemd-container
+          kpartx
+          
+    - name: Verify QEMU setup
+      run: |
+        # Verify QEMU ARM64 emulation is working
+        if [ ! -f /usr/bin/qemu-aarch64-static ]; then
+          echo "ERROR: QEMU ARM64 static binary not found!"
+          exit 1
+        fi
+        echo "QEMU ARM64 binary found at /usr/bin/qemu-aarch64-static"
+        
+        # Check binfmt registration
+        if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+          echo "ARM64 binfmt_misc registration found"
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+        else
+          echo "WARNING: ARM64 binfmt_misc not registered, will set up manually"
+        fi
           
     - name: Set up QEMU for ARM64
       run: |
@@ -130,10 +166,18 @@ jobs:
         # Setup DNS
         sudo cp /etc/resolv.conf build/root/etc/resolv.conf
         
+        # Disable pacman sandboxing (Landlock not supported in GitHub Actions)
+        sudo sed -i 's/^#*DisableSandbox.*/DisableSandbox/' build/root/etc/pacman.conf
+        echo "DisableSandbox" | sudo tee -a build/root/etc/pacman.conf
+        
         # Create configuration script
         cat > config-system.sh << 'CHROOT_SCRIPT'
         #!/bin/bash
         set -e
+        
+        # Set environment for QEMU
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export LANG=C
         
         echo "=== Initializing Pacman ==="
         pacman-key --init
@@ -143,13 +187,13 @@ jobs:
         pacman -Sy --noconfirm
         
         echo "=== Installing Raspberry Pi 5 Kernel ==="
+        # Remove incompatible kernel (may fail if not present, that's ok)
         pacman -R --noconfirm linux-aarch64 uboot-raspberrypi 2>/dev/null || true
         pacman -S --noconfirm --overwrite "/boot/*" linux-rpi-16k linux-firmware
         
-        echo "=== Installing GNOME Desktop ==="
+        echo "=== Installing GNOME Desktop (this takes a while) ==="
         pacman -S --noconfirm --needed \
           gnome \
-          gnome-extra \
           gdm \
           networkmanager \
           base-devel \
@@ -159,6 +203,15 @@ jobs:
           sudo \
           firefox \
           htop
+        
+        echo "=== Installing GNOME Extra packages ==="  
+        pacman -S --noconfirm --needed \
+          gnome-tweaks \
+          gnome-shell-extensions \
+          file-roller \
+          nautilus \
+          gnome-terminal \
+          || echo "Some GNOME packages failed, continuing..."
           
         echo "=== Installing additional packages ==="
         pacman -S --noconfirm --needed \
@@ -209,9 +262,21 @@ jobs:
         sudo cp config-system.sh build/root/root/config-system.sh
         sudo chmod +x build/root/root/config-system.sh
         
-        # Run in QEMU chroot
+        # Mount necessary filesystems for chroot
+        sudo mount --bind /dev build/root/dev
+        sudo mount --bind /dev/pts build/root/dev/pts
+        sudo mount --bind /proc build/root/proc
+        sudo mount --bind /sys build/root/sys
+        
+        # Run in chroot with QEMU
         echo "Running system configuration (this may take 30-45 minutes)..."
-        sudo systemd-nspawn -D build/root /root/config-system.sh
+        sudo chroot build/root /root/config-system.sh
+        
+        # Unmount filesystems
+        sudo umount build/root/sys || true
+        sudo umount build/root/proc || true
+        sudo umount build/root/dev/pts || true
+        sudo umount build/root/dev || true
         
         # Cleanup
         sudo rm build/root/root/config-system.sh
