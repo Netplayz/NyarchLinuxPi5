@@ -1,4 +1,4 @@
-          name: Build NyarchLinux for Raspberry Pi 5
+name: Build NyarchLinux for Raspberry Pi 5 (Production)
 
 on:
   push:
@@ -12,208 +12,523 @@ on:
         required: false
         type: boolean
         default: false
+      image_size:
+        description: 'Image size (e.g., 6G, 8G, 10G)'
+        required: false
+        type: string
+        default: '8G'
+      skip_tests:
+        description: 'Skip image validation tests'
+        required: false
+        type: boolean
+        default: false
   schedule:
-    # Build weekly on Sunday at 00:00 UTC
-    - cron: '0 0 * * 0'
+    - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
 
 env:
   IMAGE_NAME: NyarchLinux-Pi5
-  IMAGE_SIZE: 8G
+  IMAGE_SIZE: ${{ github.event.inputs.image_size || '8G' }}
+  BUILD_DATE: ${{ github.run_number }}
+  DEBIAN_FRONTEND: noninteractive
 
 jobs:
-  build:
+  validate:
+    name: Validate Build Configuration
     runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      build_version: ${{ steps.version.outputs.version }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+      with:
+        fetch-depth: 0
+    
+    - name: Validate image size
+      id: check
+      run: |
+        SIZE="${{ env.IMAGE_SIZE }}"
+        if [[ ! $SIZE =~ ^[0-9]+[GMK]$ ]]; then
+          echo "::error::Invalid image size format: $SIZE"
+          exit 1
+        fi
+        
+        # Extract numeric value
+        NUM=$(echo $SIZE | sed 's/[GMK]$//')
+        UNIT=$(echo $SIZE | sed 's/^[0-9]*//')
+        
+        # Convert to GB for validation
+        case $UNIT in
+          G) SIZE_GB=$NUM ;;
+          M) SIZE_GB=$(awk "BEGIN {print $NUM/1024}") ;;
+          K) SIZE_GB=$(awk "BEGIN {print $NUM/1048576}") ;;
+        esac
+        
+        # Minimum 4GB, maximum 16GB
+        if (( $(echo "$SIZE_GB < 4" | bc -l) )); then
+          echo "::error::Image size too small (minimum 4G)"
+          exit 1
+        fi
+        if (( $(echo "$SIZE_GB > 16" | bc -l) )); then
+          echo "::error::Image size too large (maximum 16G, would exceed runner disk space)"
+          exit 1
+        fi
+        
+        echo "should_build=true" >> $GITHUB_OUTPUT
+        echo "✅ Image size validated: $SIZE ($SIZE_GB GB)"
+    
+    - name: Generate version
+      id: version
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION=$(date +%Y.%m.%d)-build${{ github.run_number }}
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "📦 Build version: $VERSION"
+    
+    - name: Check for package list
+      run: |
+        if [ ! -f "packages.aarch64" ]; then
+          echo "::warning::packages.aarch64 not found, will use default packages"
+        else
+          echo "✅ Found packages.aarch64"
+          wc -l packages.aarch64
+        fi
+
+  build:
+    name: Build Pi5 Image
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up build environment
+      run: |
+        echo "🔧 Setting up build environment"
+        echo "BUILD_VERSION=${{ needs.validate.outputs.build_version }}" >> $GITHUB_ENV
+        echo "WORK_DIR=${GITHUB_WORKSPACE}/build" >> $GITHUB_ENV
+        echo "OUTPUT_DIR=${GITHUB_WORKSPACE}/output" >> $GITHUB_ENV
+        echo "LOG_DIR=${GITHUB_WORKSPACE}/logs" >> $GITHUB_ENV
+        
+        # Create directories
+        mkdir -p "${GITHUB_WORKSPACE}"/{build/{boot,root},output,logs}
+    
     - name: Free up disk space
       run: |
-        echo "Disk space before cleanup:"
+        echo "💾 Freeing up disk space..."
         df -h
         
-        # Remove unnecessary packages
-        sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-cloud-sdk google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri
+        # Remove large unnecessary packages
+        sudo apt-get remove -y \
+          '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' \
+          azure-cli google-cloud-sdk google-chrome-stable firefox \
+          powershell mono-devel || true
+        
         sudo apt-get autoremove -y
         sudo apt-get clean
         
         # Remove large directories
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/share/boost \
+          "$AGENT_TOOLSDIRECTORY"
         
-        echo "Disk space after cleanup:"
+        # Clear docker
+        docker system prune -af || true
+        
+        echo "✅ Disk space after cleanup:"
         df -h
         
+        # Ensure we have at least 12GB free
+        FREE_GB=$(df / --output=avail | tail -n1 | awk '{print int($1/1024/1024)}')
+        if [ $FREE_GB -lt 12 ]; then
+          echo "::error::Insufficient disk space: ${FREE_GB}GB free (need at least 12GB)"
+          exit 1
+        fi
+        echo "✅ Available space: ${FREE_GB}GB"
+    
     - name: Install dependencies
       run: |
+        echo "📦 Installing dependencies..."
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo apt-get install -y --no-install-recommends \
           qemu-user-static \
           binfmt-support \
           arch-install-scripts \
           parted \
           dosfstools \
+          e2fsprogs \
           wget \
-          kpartx
-          
-    - name: Verify QEMU setup
+          curl \
+          kpartx \
+          pigz \
+          pv \
+          bc
+        
+        echo "✅ Dependencies installed"
+    
+    - name: Verify QEMU ARM64 support
       run: |
-        # Verify QEMU ARM64 emulation is working
+        echo "🔍 Verifying QEMU ARM64 emulation..."
+        
         if [ ! -f /usr/bin/qemu-aarch64-static ]; then
-          echo "ERROR: QEMU ARM64 static binary not found!"
+          echo "::error::QEMU ARM64 static binary not found"
           exit 1
         fi
-        echo "QEMU ARM64 binary found at /usr/bin/qemu-aarch64-static"
+        
+        # Test QEMU
+        if ! /usr/bin/qemu-aarch64-static --version; then
+          echo "::error::QEMU ARM64 binary not working"
+          exit 1
+        fi
         
         # Check binfmt registration
         if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-          echo "ARM64 binfmt_misc registration found"
+          echo "✅ ARM64 binfmt_misc registered:"
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64
         else
-          echo "WARNING: ARM64 binfmt_misc not registered, will set up manually"
+          echo "⚠️  ARM64 binfmt_misc not registered, setting up..."
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
         fi
-          
-    - name: Set up QEMU for ARM64
-      run: |
-        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
         
+        echo "✅ QEMU ARM64 verification complete"
+    
     - name: Download Arch Linux ARM
       run: |
-        echo "Downloading Arch Linux ARM for aarch64..."
-        wget -q --show-progress http://os.archlinuxarm.org/os/ArchLinuxARM-rpi-aarch64-latest.tar.gz
+        echo "⬇️  Downloading Arch Linux ARM..."
         
-    - name: Create build directories
-      run: |
-        mkdir -p build/{boot,root}
-        mkdir -p output
+        TARBALL="ArchLinuxARM-rpi-aarch64-latest.tar.gz"
+        URL="http://os.archlinuxarm.org/os/$TARBALL"
         
+        # Download with retry
+        for i in {1..3}; do
+          if wget -q --show-progress --timeout=60 --tries=3 -O "$TARBALL" "$URL"; then
+            echo "✅ Download successful"
+            break
+          fi
+          echo "⚠️  Download attempt $i failed, retrying..."
+          sleep 10
+          if [ $i -eq 3 ]; then
+            echo "::error::Failed to download Arch Linux ARM after 3 attempts"
+            exit 1
+          fi
+        done
+        
+        # Verify download
+        if [ ! -f "$TARBALL" ]; then
+          echo "::error::Tarball not found after download"
+          exit 1
+        fi
+        
+        SIZE=$(du -h "$TARBALL" | cut -f1)
+        echo "📦 Downloaded: $TARBALL ($SIZE)"
+        
+        # Basic integrity check
+        if ! tar -tzf "$TARBALL" > /dev/null 2>&1; then
+          echo "::error::Downloaded tarball is corrupted"
+          exit 1
+        fi
+        
+        echo "✅ Tarball integrity verified"
+    
     - name: Create disk image
       run: |
-        echo "Creating disk image..."
-        dd if=/dev/zero of=output/${{ env.IMAGE_NAME }}-$(date +%Y%m%d).img bs=1 count=0 seek=${{ env.IMAGE_SIZE }}
+        echo "💿 Creating disk image..."
         
-    - name: Setup loop device and partitions
+        IMAGE_FILE="${OUTPUT_DIR}/${IMAGE_NAME}-${{ env.BUILD_VERSION }}.img"
+        echo "IMAGE_FILE=$IMAGE_FILE" >> $GITHUB_ENV
+        
+        # Create sparse file
+        dd if=/dev/zero of="$IMAGE_FILE" bs=1 count=0 seek=${{ env.IMAGE_SIZE }} status=progress
+        
+        if [ ! -f "$IMAGE_FILE" ]; then
+          echo "::error::Failed to create image file"
+          exit 1
+        fi
+        
+        SIZE=$(du -h "$IMAGE_FILE" | cut -f1)
+        echo "✅ Created: $IMAGE_FILE ($SIZE)"
+    
+    - name: Setup partitions
+      id: partitions
       run: |
-        set -e
+        echo "🔧 Setting up partitions..."
         
-        # Setup loop device
-        export LOOP_DEV=$(sudo losetup -f)
-        sudo losetup $LOOP_DEV output/${{ env.IMAGE_NAME }}-$(date +%Y%m%d).img
+        # Find available loop device
+        LOOP_DEV=$(sudo losetup -f)
+        if [ -z "$LOOP_DEV" ]; then
+          echo "::error::No available loop device"
+          exit 1
+        fi
+        
+        echo "Using loop device: $LOOP_DEV"
         echo "LOOP_DEV=$LOOP_DEV" >> $GITHUB_ENV
         
-        # Create partitions
-        sudo parted -s $LOOP_DEV mklabel msdos
-        sudo parted -s $LOOP_DEV mkpart primary fat32 1MiB 513MiB
-        sudo parted -s $LOOP_DEV mkpart primary ext4 513MiB 100%
-        sudo parted -s $LOOP_DEV set 1 boot on
+        # Setup loop device with retry
+        for i in {1..3}; do
+          if sudo losetup "$LOOP_DEV" "$IMAGE_FILE"; then
+            echo "✅ Loop device attached"
+            break
+          fi
+          echo "⚠️  Attempt $i failed, retrying..."
+          sleep 2
+          if [ $i -eq 3 ]; then
+            echo "::error::Failed to attach loop device"
+            exit 1
+          fi
+        done
         
-        # Wait for devices
-        sudo partprobe $LOOP_DEV
-        sleep 5
+        # Create partition table
+        echo "Creating partition table..."
+        sudo parted -s "$LOOP_DEV" mklabel msdos
+        sudo parted -s "$LOOP_DEV" mkpart primary fat32 1MiB 513MiB
+        sudo parted -s "$LOOP_DEV" mkpart primary ext4 513MiB 100%
+        sudo parted -s "$LOOP_DEV" set 1 boot on
         
-        # Use kpartx to map partitions
-        sudo kpartx -av $LOOP_DEV
+        # Force kernel to re-read partition table
+        sudo partprobe "$LOOP_DEV"
+        sleep 3
+        
+        # Use kpartx for partition mapping
+        echo "Mapping partitions with kpartx..."
+        sudo kpartx -av "$LOOP_DEV"
         sleep 2
         
-        # Find partition devices
-        export BOOT_DEV=/dev/mapper/$(basename $LOOP_DEV)p1
-        export ROOT_DEV=/dev/mapper/$(basename $LOOP_DEV)p2
+        # Determine partition devices
+        LOOP_BASE=$(basename "$LOOP_DEV")
+        BOOT_DEV="/dev/mapper/${LOOP_BASE}p1"
+        ROOT_DEV="/dev/mapper/${LOOP_BASE}p2"
+        
+        # Verify devices exist
+        for i in {1..10}; do
+          if [ -e "$BOOT_DEV" ] && [ -e "$ROOT_DEV" ]; then
+            echo "✅ Partition devices available"
+            break
+          fi
+          echo "⏳ Waiting for partition devices... ($i/10)"
+          sleep 1
+          if [ $i -eq 10 ]; then
+            echo "::error::Partition devices not available"
+            sudo kpartx -l "$LOOP_DEV"
+            exit 1
+          fi
+        done
+        
         echo "BOOT_DEV=$BOOT_DEV" >> $GITHUB_ENV
         echo "ROOT_DEV=$ROOT_DEV" >> $GITHUB_ENV
         
         # Format partitions
-        sudo mkfs.vfat -F 32 $BOOT_DEV
-        sudo mkfs.ext4 -F $ROOT_DEV
+        echo "Formatting boot partition (FAT32)..."
+        sudo mkfs.vfat -F 32 -n BOOT "$BOOT_DEV"
         
+        echo "Formatting root partition (ext4)..."
+        sudo mkfs.ext4 -F -L rootfs "$ROOT_DEV"
+        
+        echo "✅ Partitions created and formatted"
+        sudo lsblk "$LOOP_DEV"
+    
     - name: Mount partitions
       run: |
-        sudo mount ${{ env.ROOT_DEV }} build/root
-        sudo mount ${{ env.BOOT_DEV }} build/boot
+        echo "📂 Mounting partitions..."
         
-    - name: Extract Arch Linux ARM
+        # Mount with verification
+        if ! sudo mount "$ROOT_DEV" "$WORK_DIR/root"; then
+          echo "::error::Failed to mount root partition"
+          exit 1
+        fi
+        
+        if ! sudo mount "$BOOT_DEV" "$WORK_DIR/boot"; then
+          echo "::error::Failed to mount boot partition"
+          sudo umount "$WORK_DIR/root" || true
+          exit 1
+        fi
+        
+        # Verify mounts
+        if ! mountpoint -q "$WORK_DIR/root"; then
+          echo "::error::Root not mounted"
+          exit 1
+        fi
+        
+        if ! mountpoint -q "$WORK_DIR/boot"; then
+          echo "::error::Boot not mounted"
+          exit 1
+        fi
+        
+        echo "✅ Partitions mounted"
+        df -h | grep -E "boot|root"
+    
+    - name: Extract base system
       run: |
-        echo "Extracting base system..."
-        sudo tar -xpf ArchLinuxARM-rpi-aarch64-latest.tar.gz -C build/root --numeric-owner
+        echo "📦 Extracting Arch Linux ARM base system..."
         
-    - name: Configure system with QEMU chroot
+        # Extract with progress
+        if ! pv ArchLinuxARM-rpi-aarch64-latest.tar.gz | \
+             sudo tar -xzpf - -C "$WORK_DIR/root" --numeric-owner; then
+          echo "::error::Failed to extract base system"
+          exit 1
+        fi
+        
+        # Verify extraction
+        if [ ! -d "$WORK_DIR/root/usr" ] || [ ! -d "$WORK_DIR/root/etc" ]; then
+          echo "::error::Base system extraction incomplete"
+          exit 1
+        fi
+        
+        echo "✅ Base system extracted"
+        du -sh "$WORK_DIR/root"
+    
+    - name: Prepare chroot environment
       run: |
-        set -e
+        echo "🔧 Preparing chroot environment..."
         
-        # Copy QEMU binary for ARM64 emulation
-        sudo cp /usr/bin/qemu-aarch64-static build/root/usr/bin/
+        # Copy QEMU binary
+        sudo cp /usr/bin/qemu-aarch64-static "$WORK_DIR/root/usr/bin/"
+        sudo chmod +x "$WORK_DIR/root/usr/bin/qemu-aarch64-static"
         
         # Setup DNS
-        sudo cp /etc/resolv.conf build/root/etc/resolv.conf
+        sudo cp /etc/resolv.conf "$WORK_DIR/root/etc/resolv.conf"
         
-        # Disable pacman sandboxing (Landlock not supported in GitHub Actions)
-        sudo sed -i 's/^#*DisableSandbox.*/DisableSandbox/' build/root/etc/pacman.conf
-        echo "DisableSandbox" | sudo tee -a build/root/etc/pacman.conf
+        # Disable pacman sandboxing for GitHub Actions compatibility
+        echo "Disabling pacman sandboxing..."
+        sudo sed -i 's/^#*DisableSandbox.*/DisableSandbox/' "$WORK_DIR/root/etc/pacman.conf"
+        if ! grep -q "^DisableSandbox" "$WORK_DIR/root/etc/pacman.conf"; then
+          echo "DisableSandbox" | sudo tee -a "$WORK_DIR/root/etc/pacman.conf"
+        fi
         
-        # Create configuration script
+        # Verify configuration
+        if ! grep -q "^DisableSandbox" "$WORK_DIR/root/etc/pacman.conf"; then
+          echo "::error::Failed to disable pacman sandboxing"
+          exit 1
+        fi
+        
+        echo "✅ Chroot environment prepared"
+    
+    - name: Configure system
+      run: |
+        set -e
+        echo "⚙️  Configuring system (this takes 30-60 minutes)..."
+        
+        # Create comprehensive configuration script
         cat > config-system.sh << 'CHROOT_SCRIPT'
         #!/bin/bash
-        set -e
+        set -euo pipefail
         
-        # Set environment for QEMU
+        # Logging
+        exec > >(tee -a /var/log/build.log)
+        exec 2>&1
+        
+        echo "=== Build started: $(date) ==="
+        
+        # Environment
         export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         export LANG=C
+        export LC_ALL=C
         
         echo "=== Initializing Pacman ==="
         pacman-key --init
         pacman-key --populate archlinuxarm
         
-        echo "=== Updating system ==="
-        pacman -Sy --noconfirm
+        echo "=== Updating package databases ==="
+        for i in {1..3}; do
+          if pacman -Sy --noconfirm; then
+            echo "✅ Database sync successful"
+            break
+          fi
+          echo "⚠️  Sync attempt $i failed, retrying..."
+          sleep 5
+          if [ $i -eq 3 ]; then
+            echo "ERROR: Failed to sync databases"
+            exit 1
+          fi
+        done
         
-        echo "=== Installing Raspberry Pi 5 Kernel ==="
-        # Remove incompatible kernel (may fail if not present, that's ok)
+        echo "=== Removing old kernel packages ==="
         pacman -R --noconfirm linux-aarch64 uboot-raspberrypi 2>/dev/null || true
-        pacman -S --noconfirm --overwrite "/boot/*" linux-rpi-16k linux-firmware
         
-        echo "=== Installing GNOME Desktop (this takes a while) ==="
+        echo "=== Installing Raspberry Pi 5 kernel ==="
+        pacman -S --noconfirm --overwrite "/boot/*" linux-rpi-16k linux-firmware || {
+          echo "ERROR: Failed to install Pi5 kernel"
+          exit 1
+        }
+        
+        echo "=== Installing base system packages ==="
         pacman -S --noconfirm --needed \
-          gnome \
-          gdm \
-          networkmanager \
           base-devel \
           git \
           vim \
+          nano \
           wget \
+          curl \
           sudo \
-          firefox \
-          htop
+          networkmanager \
+          openssh \
+          htop \
+          neofetch || {
+          echo "ERROR: Failed to install base packages"
+          exit 1
+        }
         
-        echo "=== Installing GNOME Extra packages ==="  
+        echo "=== Installing GNOME core ==="
+        pacman -S --noconfirm --needed \
+          gnome-shell \
+          gnome-control-center \
+          gnome-terminal \
+          nautilus \
+          gdm \
+          xorg-server \
+          mesa || {
+          echo "ERROR: Failed to install GNOME core"
+          exit 1
+        }
+        
+        echo "=== Installing GNOME applications ==="
         pacman -S --noconfirm --needed \
           gnome-tweaks \
-          gnome-shell-extensions \
+          gnome-system-monitor \
           file-roller \
-          nautilus \
-          gnome-terminal \
-          || echo "Some GNOME packages failed, continuing..."
-          
-        echo "=== Installing additional packages ==="
+          evince \
+          eog \
+          firefox || echo "⚠️  Some GNOME apps failed"
+        
+        echo "=== Installing audio system ==="
         pacman -S --noconfirm --needed \
-          mesa \
-          pipewire pipewire-alsa pipewire-pulse \
-          wireplumber \
-          bluez bluez-utils \
-          noto-fonts noto-fonts-cjk noto-fonts-emoji
-          
-        echo "=== Enabling services ==="
+          pipewire \
+          pipewire-alsa \
+          pipewire-pulse \
+          wireplumber || echo "⚠️  Some audio packages failed"
+        
+        echo "=== Installing fonts ==="
+        pacman -S --noconfirm --needed \
+          noto-fonts \
+          noto-fonts-cjk \
+          noto-fonts-emoji \
+          ttf-dejavu || echo "⚠️  Some fonts failed"
+        
+        echo "=== Configuring services ==="
         systemctl enable gdm
         systemctl enable NetworkManager
-        systemctl enable bluetooth
+        systemctl enable sshd
         
         echo "=== Creating user ==="
-        useradd -m -G wheel,video,audio,storage,input -s /bin/bash nyarch || true
+        useradd -m -G wheel,video,audio,storage,input -s /bin/bash nyarch 2>/dev/null || true
         echo "nyarch:nyarch" | chpasswd
+        
+        echo "=== Configuring sudo ==="
         echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
         chmod 440 /etc/sudoers.d/wheel
         
         echo "=== System configuration ==="
         echo "nyarch-pi5" > /etc/hostname
+        
         cat > /etc/hosts << EOF
         127.0.0.1   localhost
         ::1         localhost
@@ -225,74 +540,109 @@ jobs:
         locale-gen
         echo "LANG=en_US.UTF-8" > /etc/locale.conf
         
-        echo "=== GNOME optimization for ARM ==="
+        echo "=== GNOME optimization ==="
         cat > /etc/profile.d/gnome-optimize.sh << 'EOF'
         export MUTTER_DEBUG_FORCE_KMS_MODE=simple
         export WEBKIT_DISABLE_COMPOSITING_MODE=1
         EOF
         chmod +x /etc/profile.d/gnome-optimize.sh
         
-        echo "=== Cleaning up ==="
+        echo "=== Cleaning package cache ==="
         pacman -Scc --noconfirm || true
+        rm -rf /var/cache/pacman/pkg/*
         
-        echo "=== Configuration complete ==="
+        echo "=== Build completed: $(date) ==="
+        echo "✅ Configuration successful"
         CHROOT_SCRIPT
         
         # Copy script
-        sudo cp config-system.sh build/root/root/config-system.sh
-        sudo chmod +x build/root/root/config-system.sh
+        sudo cp config-system.sh "$WORK_DIR/root/root/config-system.sh"
+        sudo chmod +x "$WORK_DIR/root/root/config-system.sh"
         
-        # Mount necessary filesystems for chroot
-        sudo mount --bind /dev build/root/dev
-        sudo mount --bind /dev/pts build/root/dev/pts
-        sudo mount --bind /proc build/root/proc
-        sudo mount --bind /sys build/root/sys
+        # Mount system directories
+        echo "Mounting system directories..."
+        sudo mount --bind /dev "$WORK_DIR/root/dev"
+        sudo mount --bind /dev/pts "$WORK_DIR/root/dev/pts"
+        sudo mount --bind /proc "$WORK_DIR/root/proc"
+        sudo mount --bind /sys "$WORK_DIR/root/sys"
         
-        # Run in chroot with QEMU
-        echo "Running system configuration (this may take 30-45 minutes)..."
-        sudo chroot build/root /root/config-system.sh
+        # Run configuration with proper error handling
+        echo "Running system configuration..."
+        if ! sudo chroot "$WORK_DIR/root" /root/config-system.sh; then
+          echo "::error::System configuration failed"
+          # Copy build log for debugging
+          sudo cp "$WORK_DIR/root/var/log/build.log" "$LOG_DIR/" 2>/dev/null || true
+          exit 1
+        fi
         
-        # Unmount filesystems
-        sudo umount build/root/sys || true
-        sudo umount build/root/proc || true
-        sudo umount build/root/dev/pts || true
-        sudo umount build/root/dev || true
+        # Copy build log
+        sudo cp "$WORK_DIR/root/var/log/build.log" "$LOG_DIR/" 2>/dev/null || true
         
-        # Cleanup
-        sudo rm build/root/root/config-system.sh
-        sudo rm build/root/usr/bin/qemu-aarch64-static
-        
-    - name: Configure boot files
+        echo "✅ System configured successfully"
+    
+    - name: Configure boot
       run: |
-        set -e
+        echo "🥾 Configuring boot..."
         
         # Move boot files
-        sudo mv build/root/boot/* build/boot/ 2>/dev/null || true
+        echo "Moving boot files..."
+        sudo mv "$WORK_DIR/root/boot/"* "$WORK_DIR/boot/" 2>/dev/null || true
+        
+        # Verify kernel exists
+        if [ ! -f "$WORK_DIR/boot/kernel_2712.img" ]; then
+          echo "::error::Pi5 kernel not found in boot partition"
+          ls -la "$WORK_DIR/boot/"
+          exit 1
+        fi
         
         # Create config.txt
-        sudo tee build/boot/config.txt > /dev/null << 'EOF'
+        echo "Creating config.txt..."
+        sudo tee "$WORK_DIR/boot/config.txt" > /dev/null << 'EOF'
         [pi5]
         kernel=kernel_2712.img
+        
+        # Display
         hdmi_force_hotplug=1
         disable_overscan=1
+        
+        # Memory
         gpu_mem=256
+        
+        # Audio
         dtparam=audio=on
+        
+        # System
         arm_64bit=1
         enable_uart=1
+        
+        # Performance (safe overclock)
         over_voltage=2
         arm_freq=2400
+        
         [all]
         EOF
         
         # Create cmdline.txt
-        sudo tee build/boot/cmdline.txt > /dev/null << 'EOF'
+        echo "Creating cmdline.txt..."
+        sudo tee "$WORK_DIR/boot/cmdline.txt" > /dev/null << 'EOF'
         console=serial0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait quiet splash
         EOF
         
-    - name: Add NyarchLinux branding
+        # Verify boot configuration
+        if [ ! -f "$WORK_DIR/boot/config.txt" ] || [ ! -f "$WORK_DIR/boot/cmdline.txt" ]; then
+          echo "::error::Boot configuration files missing"
+          exit 1
+        fi
+        
+        echo "✅ Boot configuration complete"
+        ls -lh "$WORK_DIR/boot/"
+    
+    - name: Add branding and build info
       run: |
-        # Create MOTD
-        sudo tee build/root/etc/motd > /dev/null << 'EOF'
+        echo "🎨 Adding NyarchLinux branding..."
+        
+        # MOTD
+        sudo tee "$WORK_DIR/root/etc/motd" > /dev/null << 'EOF'
           _   _                      _     _      _                  
          | \ | |                    | |   | |    (_)                 
          |  \| |_   _  __ _ _ __ ___| |__ | |     _ _ __  _   ___  __
@@ -305,139 +655,302 @@ jobs:
         Welcome to NyarchLinux Pi5 Edition!
         
         Default credentials: nyarch / nyarch
-        Please change your password: passwd
+        ⚠️  CHANGE PASSWORD: passwd
         
         GitHub: https://github.com/NyarchLinux/NyarchLinux
-        Built: $(date)
         EOF
         
-        # Create issue file
-        sudo tee build/root/etc/issue > /dev/null << 'EOF'
+        # Issue
+        sudo tee "$WORK_DIR/root/etc/issue" > /dev/null << 'EOF'
         NyarchLinux Pi5 \r (\l)
         
         EOF
         
-    - name: Create build info
-      run: |
-        cat > build/root/etc/nyarch-build-info << EOF
+        # Build info
+        sudo tee "$WORK_DIR/root/etc/nyarch-build-info" > /dev/null << EOF
+        Build Version: ${{ env.BUILD_VERSION }}
         Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
         Build Host: GitHub Actions
         Commit: ${{ github.sha }}
         Branch: ${{ github.ref_name }}
-        Builder: ${{ github.actor }}
+        Workflow: ${{ github.workflow }}
+        Run: ${{ github.run_number }}
         EOF
         
-    - name: Cleanup and unmount
+        echo "✅ Branding added"
+    
+    - name: Cleanup chroot
       if: always()
       run: |
-        set +e
-        sudo sync
-        sudo umount build/boot 2>/dev/null || true
-        sudo umount build/root 2>/dev/null || true
-        sudo kpartx -d ${{ env.LOOP_DEV }} 2>/dev/null || true
-        sudo losetup -d ${{ env.LOOP_DEV }} 2>/dev/null || true
+        echo "🧹 Cleaning up chroot environment..."
         
+        # Unmount system directories
+        sudo umount "$WORK_DIR/root/sys" 2>/dev/null || true
+        sudo umount "$WORK_DIR/root/proc" 2>/dev/null || true
+        sudo umount "$WORK_DIR/root/dev/pts" 2>/dev/null || true
+        sudo umount "$WORK_DIR/root/dev" 2>/dev/null || true
+        
+        # Remove QEMU binary
+        sudo rm -f "$WORK_DIR/root/usr/bin/qemu-aarch64-static"
+        sudo rm -f "$WORK_DIR/root/root/config-system.sh"
+        
+        echo "✅ Chroot cleanup complete"
+    
+    - name: Sync and unmount
+      if: always()
+      run: |
+        echo "💾 Syncing and unmounting filesystems..."
+        
+        # Sync all writes
+        sudo sync
+        sleep 2
+        
+        # Unmount filesystems
+        sudo umount "$WORK_DIR/boot" 2>/dev/null || true
+        sudo umount "$WORK_DIR/root" 2>/dev/null || true
+        
+        # Remove kpartx mappings
+        sudo kpartx -d "$LOOP_DEV" 2>/dev/null || true
+        
+        # Detach loop device
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        
+        echo "✅ Filesystems unmounted"
+    
+    - name: Validate image
+      if: ${{ github.event.inputs.skip_tests != 'true' }}
+      run: |
+        echo "🔍 Validating image..."
+        
+        # Check file exists and has content
+        if [ ! -f "$IMAGE_FILE" ]; then
+          echo "::error::Image file not found"
+          exit 1
+        fi
+        
+        SIZE=$(stat -c%s "$IMAGE_FILE")
+        if [ $SIZE -lt 1000000000 ]; then  # Less than 1GB is suspicious
+          echo "::error::Image file too small: $SIZE bytes"
+          exit 1
+        fi
+        
+        echo "✅ Image size: $(du -h "$IMAGE_FILE" | cut -f1)"
+        
+        # Mount and verify structure
+        echo "Verifying image structure..."
+        TEMP_LOOP=$(sudo losetup -f)
+        sudo losetup "$TEMP_LOOP" "$IMAGE_FILE"
+        sudo kpartx -av "$TEMP_LOOP"
+        sleep 2
+        
+        TEMP_ROOT="/tmp/verify_root"
+        TEMP_BOOT="/tmp/verify_boot"
+        mkdir -p "$TEMP_ROOT" "$TEMP_BOOT"
+        
+        LOOP_BASE=$(basename "$TEMP_LOOP")
+        sudo mount "/dev/mapper/${LOOP_BASE}p2" "$TEMP_ROOT"
+        sudo mount "/dev/mapper/${LOOP_BASE}p1" "$TEMP_BOOT"
+        
+        # Check critical files
+        ERRORS=0
+        
+        if [ ! -f "$TEMP_BOOT/kernel_2712.img" ]; then
+          echo "::error::Kernel missing from boot partition"
+          ERRORS=$((ERRORS+1))
+        fi
+        
+        if [ ! -f "$TEMP_BOOT/config.txt" ]; then
+          echo "::error::config.txt missing"
+          ERRORS=$((ERRORS+1))
+        fi
+        
+        if [ ! -d "$TEMP_ROOT/usr" ]; then
+          echo "::error::/usr directory missing"
+          ERRORS=$((ERRORS+1))
+        fi
+        
+        if [ ! -f "$TEMP_ROOT/etc/hostname" ]; then
+          echo "::error::hostname not configured"
+          ERRORS=$((ERRORS+1))
+        fi
+        
+        # Cleanup validation
+        sudo umount "$TEMP_BOOT"
+        sudo umount "$TEMP_ROOT"
+        sudo kpartx -d "$TEMP_LOOP"
+        sudo losetup -d "$TEMP_LOOP"
+        rmdir "$TEMP_ROOT" "$TEMP_BOOT"
+        
+        if [ $ERRORS -gt 0 ]; then
+          echo "::error::Image validation failed with $ERRORS errors"
+          exit 1
+        fi
+        
+        echo "✅ Image validation passed"
+    
     - name: Compress image
       run: |
-        cd output
-        IMAGE_FILE=$(ls ${{ env.IMAGE_NAME }}-*.img)
-        echo "Compressing $IMAGE_FILE..."
-        xz -9 -T0 -v $IMAGE_FILE
-        echo "IMAGE_FILE=${IMAGE_FILE}.xz" >> $GITHUB_ENV
+        echo "🗜️  Compressing image..."
         
-    - name: Calculate checksums
-      run: |
-        cd output
-        sha256sum *.img.xz > SHA256SUMS
-        cat SHA256SUMS
+        cd "$OUTPUT_DIR"
+        IMAGE=$(basename "$IMAGE_FILE")
         
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: NyarchLinux-Pi5-${{ github.sha }}
-        path: |
-          output/*.img.xz
-          output/SHA256SUMS
-        retention-days: 30
-        
-    - name: Get version for release
-      if: github.event.inputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
-      id: get_version
-      run: |
-        if [[ $GITHUB_REF == refs/tags/* ]]; then
-          VERSION=${GITHUB_REF#refs/tags/}
-        else
-          VERSION=$(date +%Y.%m.%d)
+        # Compress with pigz (parallel gzip) then xz
+        echo "Compressing with xz (high compression)..."
+        if ! pv "$IMAGE" | xz -9 -T0 > "${IMAGE}.xz"; then
+          echo "::error::Compression failed"
+          exit 1
         fi
-        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
         
-    - name: Create Release
-      if: github.event.inputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.get_version.outputs.VERSION }}
-        name: NyarchLinux Pi5 ${{ steps.get_version.outputs.VERSION }}
-        body: |
-          # NyarchLinux for Raspberry Pi 5
-          
-          **Release Date:** $(date +%Y-%m-%d)
-          
-          ## 📥 Download
-          
-          Download the `.img.xz` file below and flash it to your SD card.
-          
-          ## 🚀 Installation
-          
-          ### Linux/macOS:
-          ```bash
-          # Extract and flash
-          xz -d NyarchLinux-Pi5-*.img.xz
-          sudo dd if=NyarchLinux-Pi5-*.img of=/dev/sdX bs=4M status=progress conv=fsync
-          ```
-          
-          ### Windows:
-          Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/) or [balenaEtcher](https://www.balena.io/etcher/)
-          
-          ## 🔑 Default Credentials
-          - **Username:** nyarch
-          - **Password:** nyarch
-          
-          ⚠️ **Change the password after first login!**
-          
-          ## 📋 What's Included
-          - Arch Linux ARM base
-          - GNOME Desktop Environment
-          - Raspberry Pi 5 optimized kernel (linux-rpi-16k)
-          - PipeWire audio
-          - Firefox browser
-          - Development tools
-          
-          ## 🐛 Known Issues
-          - First boot takes 1-2 minutes (SSH key generation)
-          - GNOME animations may lag (disable for better performance)
-          
-          ## 📚 Documentation
-          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
-          
-          ---
-          
-          Built with ❤️ by the NyarchLinux community
-          
-        files: |
-          output/*.img.xz
-          output/SHA256SUMS
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Remove uncompressed image to save space
+        rm "$IMAGE"
         
-    - name: Report build status
+        COMPRESSED="${IMAGE}.xz"
+        if [ ! -f "$COMPRESSED" ]; then
+          echo "::error::Compressed file not found"
+          exit 1
+        fi
+        
+        echo "✅ Compressed: $COMPRESSED"
+        ls -lh "$COMPRESSED"
+        
+        # Calculate compression ratio
+        ORIGINAL_SIZE=$(stat -c%s "$IMAGE_FILE")
+        COMPRESSED_SIZE=$(stat -c%s "$COMPRESSED")
+        RATIO=$(awk "BEGIN {printf \"%.1f\", ($ORIGINAL_SIZE / $COMPRESSED_SIZE)}")
+        echo "📊 Compression ratio: ${RATIO}:1"
+    
+    - name: Generate checksums
+      run: |
+        echo "🔐 Generating checksums..."
+        
+        cd "$OUTPUT_DIR"
+        
+        # Generate multiple checksums for verification
+        sha256sum *.img.xz > SHA256SUMS
+        sha512sum *.img.xz > SHA512SUMS
+        md5sum *.img.xz > MD5SUMS
+        
+        echo "✅ Checksums generated:"
+        cat SHA256SUMS
+        cat SHA512SUMS
+        cat MD5SUMS
+    
+    - name: Create build report
       if: always()
       run: |
+        echo "📄 Creating build report..."
+        
+        cat > "$OUTPUT_DIR/BUILD_REPORT.txt" << EOF
+        NyarchLinux Raspberry Pi 5 Build Report
+        ========================================
+        
+        Build Information:
+        - Version: ${{ env.BUILD_VERSION }}
+        - Date: $(date -u)
+        - Workflow: ${{ github.workflow }}
+        - Run Number: ${{ github.run_number }}
+        - Commit: ${{ github.sha }}
+        - Branch: ${{ github.ref_name }}
+        - Triggered by: ${{ github.event_name }}
+        
+        Configuration:
+        - Image Size: ${{ env.IMAGE_SIZE }}
+        - Base: Arch Linux ARM (aarch64)
+        - Kernel: linux-rpi-16k
+        - Desktop: GNOME
+        
+        Build Status: ${{ job.status }}
+        
+        Default Credentials:
+        - Username: nyarch
+        - Password: nyarch
+        ⚠️  MUST BE CHANGED ON FIRST BOOT
+        
+        Installation:
+        1. Download the .img.xz file
+        2. Extract: xz -d NyarchLinux-Pi5-*.img.xz
+        3. Flash: sudo dd if=NyarchLinux-Pi5-*.img of=/dev/sdX bs=4M status=progress
+        4. Insert SD card into Pi5 and boot
+        
+        First Boot:
+        - Boot time: ~60-90 seconds
+        - Login with nyarch/nyarch
+        - Run: passwd (to change password)
+        - Run: sudo pacman -Syu (to update system)
+        
+        Support:
+        - GitHub: https://github.com/NyarchLinux/NyarchLinux
+        - Discord: https://discord.gg/xuw6BNXXE7
+        
+        Checksums:
+        $(cat "$OUTPUT_DIR/SHA256SUMS" 2>/dev/null || echo "Not available")
+        
+        Build Artifacts:
+        $(ls -lh "$OUTPUT_DIR" 2>/dev/null || echo "Not available")
+        
+        ========================================
+        EOF
+        
+        echo "✅ Build report created"
+        cat "$OUTPUT_DIR/BUILD_REPORT.txt"
+    
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ github.run_number }}
+        path: |
+          logs/
+        retention-days: 14
+    
+    - name: Upload image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.IMAGE_NAME }}-${{ env.BUILD_VERSION }}
+        path: |
+          output/*.img.xz
+          output/*SUMS
+          output/BUILD_REPORT.txt
+        retention-days: 30
+        compression-level: 0  # Already compressed
+    
+    - name: Create release
+      if: |
+        (github.event.inputs.release == 'true' || startsWith(github.ref, 'refs/tags/')) &&
+        success()
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ env.BUILD_VERSION }}
+        name: NyarchLinux Pi5 ${{ env.BUILD_VERSION }}
+        body_path: output/BUILD_REPORT.txt
+        files: |
+          output/*.img.xz
+          output/*SUMS
+        draft: false
+        prerelease: false
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Final status report
+      if: always()
+      run: |
+        echo "========================================"
+        echo "Build Summary"
+        echo "========================================"
+        echo "Status: ${{ job.status }}"
+        echo "Version: ${{ env.BUILD_VERSION }}"
+        echo "Duration: ${{ job.duration }} minutes"
+        echo "========================================"
+        
         if [ "${{ job.status }}" == "success" ]; then
-          echo "✅ Build completed successfully!"
-          echo "📦 Image size: $(du -h output/*.img.xz | cut -f1)"
+          echo "✅ BUILD SUCCESSFUL!"
+          echo "📦 Image: $(ls output/*.img.xz 2>/dev/null || echo 'Not found')"
+          echo "📊 Size: $(du -h output/*.img.xz 2>/dev/null | cut -f1 || echo 'N/A')"
+          echo "🔐 SHA256: $(cat output/SHA256SUMS 2>/dev/null || echo 'Not found')"
         else
-          echo "❌ Build failed!"
+          echo "❌ BUILD FAILED!"
+          echo "Check logs above for details"
           exit 1
         fi
