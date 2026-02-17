@@ -1,0 +1,398 @@
+name: Build NyarchLinux for Raspberry Pi 5
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Create a release'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Build weekly on Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+
+env:
+  IMAGE_NAME: NyarchLinux-Pi5
+  IMAGE_SIZE: 8G
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Free up disk space
+      run: |
+        echo "Disk space before cleanup:"
+        df -h
+        
+        # Remove unnecessary packages
+        sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-cloud-sdk google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        
+        # Remove large directories
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        
+        echo "Disk space after cleanup:"
+        df -h
+        
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          qemu-user-static \
+          binfmt-support \
+          arch-install-scripts \
+          parted \
+          dosfstools \
+          wget \
+          kpartx \
+          systemd-container
+          
+    - name: Set up QEMU for ARM64
+      run: |
+        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+        
+    - name: Download Arch Linux ARM
+      run: |
+        echo "Downloading Arch Linux ARM for aarch64..."
+        wget -q --show-progress http://os.archlinuxarm.org/os/ArchLinuxARM-rpi-aarch64-latest.tar.gz
+        
+    - name: Create build directories
+      run: |
+        mkdir -p build/{boot,root}
+        mkdir -p output
+        
+    - name: Create disk image
+      run: |
+        echo "Creating disk image..."
+        dd if=/dev/zero of=output/${{ env.IMAGE_NAME }}-$(date +%Y%m%d).img bs=1 count=0 seek=${{ env.IMAGE_SIZE }}
+        
+    - name: Setup loop device and partitions
+      run: |
+        set -e
+        
+        # Setup loop device
+        export LOOP_DEV=$(sudo losetup -f)
+        sudo losetup $LOOP_DEV output/${{ env.IMAGE_NAME }}-$(date +%Y%m%d).img
+        echo "LOOP_DEV=$LOOP_DEV" >> $GITHUB_ENV
+        
+        # Create partitions
+        sudo parted -s $LOOP_DEV mklabel msdos
+        sudo parted -s $LOOP_DEV mkpart primary fat32 1MiB 513MiB
+        sudo parted -s $LOOP_DEV mkpart primary ext4 513MiB 100%
+        sudo parted -s $LOOP_DEV set 1 boot on
+        
+        # Wait for devices
+        sudo partprobe $LOOP_DEV
+        sleep 5
+        
+        # Use kpartx to map partitions
+        sudo kpartx -av $LOOP_DEV
+        sleep 2
+        
+        # Find partition devices
+        export BOOT_DEV=/dev/mapper/$(basename $LOOP_DEV)p1
+        export ROOT_DEV=/dev/mapper/$(basename $LOOP_DEV)p2
+        echo "BOOT_DEV=$BOOT_DEV" >> $GITHUB_ENV
+        echo "ROOT_DEV=$ROOT_DEV" >> $GITHUB_ENV
+        
+        # Format partitions
+        sudo mkfs.vfat -F 32 $BOOT_DEV
+        sudo mkfs.ext4 -F $ROOT_DEV
+        
+    - name: Mount partitions
+      run: |
+        sudo mount ${{ env.ROOT_DEV }} build/root
+        sudo mount ${{ env.BOOT_DEV }} build/boot
+        
+    - name: Extract Arch Linux ARM
+      run: |
+        echo "Extracting base system..."
+        sudo tar -xpf ArchLinuxARM-rpi-aarch64-latest.tar.gz -C build/root --numeric-owner
+        
+    - name: Configure system with QEMU chroot
+      run: |
+        set -e
+        
+        # Copy QEMU binary for ARM64 emulation
+        sudo cp /usr/bin/qemu-aarch64-static build/root/usr/bin/
+        
+        # Setup DNS
+        sudo cp /etc/resolv.conf build/root/etc/resolv.conf
+        
+        # Create configuration script
+        cat > config-system.sh << 'CHROOT_SCRIPT'
+        #!/bin/bash
+        set -e
+        
+        echo "=== Initializing Pacman ==="
+        pacman-key --init
+        pacman-key --populate archlinuxarm
+        
+        echo "=== Updating system ==="
+        pacman -Sy --noconfirm
+        
+        echo "=== Installing Raspberry Pi 5 Kernel ==="
+        pacman -R --noconfirm linux-aarch64 uboot-raspberrypi 2>/dev/null || true
+        pacman -S --noconfirm --overwrite "/boot/*" linux-rpi-16k linux-firmware
+        
+        echo "=== Installing GNOME Desktop ==="
+        pacman -S --noconfirm --needed \
+          gnome \
+          gnome-extra \
+          gdm \
+          networkmanager \
+          base-devel \
+          git \
+          vim \
+          wget \
+          sudo \
+          firefox \
+          htop
+          
+        echo "=== Installing additional packages ==="
+        pacman -S --noconfirm --needed \
+          mesa \
+          pipewire pipewire-alsa pipewire-pulse \
+          wireplumber \
+          bluez bluez-utils \
+          noto-fonts noto-fonts-cjk noto-fonts-emoji
+          
+        echo "=== Enabling services ==="
+        systemctl enable gdm
+        systemctl enable NetworkManager
+        systemctl enable bluetooth
+        
+        echo "=== Creating user ==="
+        useradd -m -G wheel,video,audio,storage,input -s /bin/bash nyarch || true
+        echo "nyarch:nyarch" | chpasswd
+        echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
+        chmod 440 /etc/sudoers.d/wheel
+        
+        echo "=== System configuration ==="
+        echo "nyarch-pi5" > /etc/hostname
+        cat > /etc/hosts << EOF
+        127.0.0.1   localhost
+        ::1         localhost
+        127.0.1.1   nyarch-pi5.localdomain nyarch-pi5
+        EOF
+        
+        echo "=== Locale configuration ==="
+        echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+        locale-gen
+        echo "LANG=en_US.UTF-8" > /etc/locale.conf
+        
+        echo "=== GNOME optimization for ARM ==="
+        cat > /etc/profile.d/gnome-optimize.sh << 'EOF'
+        export MUTTER_DEBUG_FORCE_KMS_MODE=simple
+        export WEBKIT_DISABLE_COMPOSITING_MODE=1
+        EOF
+        chmod +x /etc/profile.d/gnome-optimize.sh
+        
+        echo "=== Cleaning up ==="
+        pacman -Scc --noconfirm || true
+        
+        echo "=== Configuration complete ==="
+        CHROOT_SCRIPT
+        
+        # Copy script
+        sudo cp config-system.sh build/root/root/config-system.sh
+        sudo chmod +x build/root/root/config-system.sh
+        
+        # Run in QEMU chroot
+        echo "Running system configuration (this may take 30-45 minutes)..."
+        sudo systemd-nspawn -D build/root /root/config-system.sh
+        
+        # Cleanup
+        sudo rm build/root/root/config-system.sh
+        sudo rm build/root/usr/bin/qemu-aarch64-static
+        
+    - name: Configure boot files
+      run: |
+        set -e
+        
+        # Move boot files
+        sudo mv build/root/boot/* build/boot/ 2>/dev/null || true
+        
+        # Create config.txt
+        sudo tee build/boot/config.txt > /dev/null << 'EOF'
+        [pi5]
+        kernel=kernel_2712.img
+        hdmi_force_hotplug=1
+        disable_overscan=1
+        gpu_mem=256
+        dtparam=audio=on
+        arm_64bit=1
+        enable_uart=1
+        over_voltage=2
+        arm_freq=2400
+        [all]
+        EOF
+        
+        # Create cmdline.txt
+        sudo tee build/boot/cmdline.txt > /dev/null << 'EOF'
+        console=serial0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait quiet splash
+        EOF
+        
+    - name: Add NyarchLinux branding
+      run: |
+        # Create MOTD
+        sudo tee build/root/etc/motd > /dev/null << 'EOF'
+          _   _                      _     _      _                  
+         | \ | |                    | |   | |    (_)                 
+         |  \| |_   _  __ _ _ __ ___| |__ | |     _ _ __  _   ___  __
+         | . ` | | | |/ _` | '__/ __| '_ \| |    | | '_ \| | | \ \/ /
+         | |\  | |_| | (_| | | | (__| | | | |____| | | | | |_| |>  < 
+         |_| \_|\__, |\__,_|_|  \___|_| |_|______|_|_| |_|\__,_/_/\_\
+                 __/ |                                                
+                |___/   for Raspberry Pi 5
+        
+        Welcome to NyarchLinux Pi5 Edition!
+        
+        Default credentials: nyarch / nyarch
+        Please change your password: passwd
+        
+        GitHub: https://github.com/NyarchLinux/NyarchLinux
+        Built: $(date)
+        EOF
+        
+        # Create issue file
+        sudo tee build/root/etc/issue > /dev/null << 'EOF'
+        NyarchLinux Pi5 \r (\l)
+        
+        EOF
+        
+    - name: Create build info
+      run: |
+        cat > build/root/etc/nyarch-build-info << EOF
+        Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        Build Host: GitHub Actions
+        Commit: ${{ github.sha }}
+        Branch: ${{ github.ref_name }}
+        Builder: ${{ github.actor }}
+        EOF
+        
+    - name: Cleanup and unmount
+      if: always()
+      run: |
+        set +e
+        sudo sync
+        sudo umount build/boot 2>/dev/null || true
+        sudo umount build/root 2>/dev/null || true
+        sudo kpartx -d ${{ env.LOOP_DEV }} 2>/dev/null || true
+        sudo losetup -d ${{ env.LOOP_DEV }} 2>/dev/null || true
+        
+    - name: Compress image
+      run: |
+        cd output
+        IMAGE_FILE=$(ls ${{ env.IMAGE_NAME }}-*.img)
+        echo "Compressing $IMAGE_FILE..."
+        xz -9 -T0 -v $IMAGE_FILE
+        echo "IMAGE_FILE=${IMAGE_FILE}.xz" >> $GITHUB_ENV
+        
+    - name: Calculate checksums
+      run: |
+        cd output
+        sha256sum *.img.xz > SHA256SUMS
+        cat SHA256SUMS
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NyarchLinux-Pi5-${{ github.sha }}
+        path: |
+          output/*.img.xz
+          output/SHA256SUMS
+        retention-days: 30
+        
+    - name: Get version for release
+      if: github.event.inputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
+      id: get_version
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION=$(date +%Y.%m.%d)
+        fi
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+        
+    - name: Create Release
+      if: github.event.inputs.release == 'true' || startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.VERSION }}
+        name: NyarchLinux Pi5 ${{ steps.get_version.outputs.VERSION }}
+        body: |
+          # NyarchLinux for Raspberry Pi 5
+          
+          **Release Date:** $(date +%Y-%m-%d)
+          
+          ## 📥 Download
+          
+          Download the `.img.xz` file below and flash it to your SD card.
+          
+          ## 🚀 Installation
+          
+          ### Linux/macOS:
+          ```bash
+          # Extract and flash
+          xz -d NyarchLinux-Pi5-*.img.xz
+          sudo dd if=NyarchLinux-Pi5-*.img of=/dev/sdX bs=4M status=progress conv=fsync
+          ```
+          
+          ### Windows:
+          Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/) or [balenaEtcher](https://www.balena.io/etcher/)
+          
+          ## 🔑 Default Credentials
+          - **Username:** nyarch
+          - **Password:** nyarch
+          
+          ⚠️ **Change the password after first login!**
+          
+          ## 📋 What's Included
+          - Arch Linux ARM base
+          - GNOME Desktop Environment
+          - Raspberry Pi 5 optimized kernel (linux-rpi-16k)
+          - PipeWire audio
+          - Firefox browser
+          - Development tools
+          
+          ## 🐛 Known Issues
+          - First boot takes 1-2 minutes (SSH key generation)
+          - GNOME animations may lag (disable for better performance)
+          
+          ## 📚 Documentation
+          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          
+          ---
+          
+          Built with ❤️ by the NyarchLinux community
+          
+        files: |
+          output/*.img.xz
+          output/SHA256SUMS
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Report build status
+      if: always()
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "✅ Build completed successfully!"
+          echo "📦 Image size: $(du -h output/*.img.xz | cut -f1)"
+        else
+          echo "❌ Build failed!"
+          exit 1
+        fi
