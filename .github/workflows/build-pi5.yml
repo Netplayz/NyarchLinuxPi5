@@ -401,8 +401,41 @@ jobs:
         sudo cp /usr/bin/qemu-aarch64-static "$WORK_DIR/root/usr/bin/"
         sudo chmod +x "$WORK_DIR/root/usr/bin/qemu-aarch64-static"
         
-        # Setup DNS
+        # Setup DNS - critical for package downloads
+        echo "Configuring DNS..."
+        
+        # Method 1: Copy resolv.conf
         sudo cp /etc/resolv.conf "$WORK_DIR/root/etc/resolv.conf"
+        
+        # Method 2: Create backup DNS config with public DNS servers
+        sudo tee "$WORK_DIR/root/etc/resolv.conf.backup" > /dev/null << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF
+        
+        # Use backup if primary doesn't have nameservers
+        if ! grep -q "nameserver" "$WORK_DIR/root/etc/resolv.conf" 2>/dev/null; then
+          echo "⚠️ No nameservers in resolv.conf, using public DNS"
+          sudo cp "$WORK_DIR/root/etc/resolv.conf.backup" "$WORK_DIR/root/etc/resolv.conf"
+        fi
+        
+        # Verify DNS configuration
+        echo "DNS configuration:"
+        cat "$WORK_DIR/root/etc/resolv.conf"
+        
+        # Configure pacman mirrors with fallbacks
+        echo "Configuring pacman mirrors..."
+        sudo tee "$WORK_DIR/root/etc/pacman.d/mirrorlist" > /dev/null << 'EOF'
+# Primary mirror
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+
+# Fallback mirrors
+Server = http://ca.mirror.archlinuxarm.org/$arch/$repo
+Server = http://de.mirror.archlinuxarm.org/$arch/$repo
+Server = http://fl.us.mirror.archlinuxarm.org/$arch/$repo
+Server = http://hu.mirror.archlinuxarm.org/$arch/$repo
+EOF
         
         # Disable pacman sandboxing for GitHub Actions compatibility
         echo "Disabling pacman sandboxing..."
@@ -418,6 +451,8 @@ jobs:
         fi
         
         echo "✅ Chroot environment prepared"
+        echo "DNS servers configured:"
+        grep nameserver "$WORK_DIR/root/etc/resolv.conf"
     
     - name: Configure system
       run: |
@@ -444,16 +479,39 @@ jobs:
         pacman-key --init
         pacman-key --populate archlinuxarm
         
+        echo "=== Verifying network connectivity ==="
+        echo "DNS configuration:"
+        cat /etc/resolv.conf
+        
+        # Test basic connectivity
+        echo "Testing network..."
+        if ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1; then
+          echo "✅ Network connectivity OK"
+        else
+          echo "⚠️ Network connectivity issue detected"
+        fi
+        
+        # Test mirror reachability
+        echo "Testing mirror connectivity..."
+        if curl -s --connect-timeout 10 -I http://mirror.archlinuxarm.org/ >/dev/null 2>&1; then
+          echo "✅ Primary mirror reachable"
+        else
+          echo "⚠️ Primary mirror unreachable, will use fallback mirrors"
+        fi
+        
         echo "=== Updating package databases ==="
-        for i in {1..3}; do
-          if pacman -Sy --noconfirm; then
+        for i in {1..5}; do
+          if pacman -Sy --noconfirm 2>&1; then
             echo "✅ Database sync successful"
             break
           fi
-          echo "⚠️  Sync attempt $i failed, retrying..."
-          sleep 5
-          if [ $i -eq 3 ]; then
-            echo "ERROR: Failed to sync databases"
+          echo "⚠️ Sync attempt $i failed, waiting 15 seconds before retry..."
+          sleep 15
+          if [ $i -eq 5 ]; then
+            echo "ERROR: Failed to sync databases after 5 attempts"
+            echo "This is likely a temporary mirror availability issue"
+            echo "Available mirrors:"
+            cat /etc/pacman.d/mirrorlist
             exit 1
           fi
         done
